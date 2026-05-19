@@ -1,0 +1,142 @@
+# Weft full-stack deployment
+# Copy .env.example to .env and fill in the required values before running.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: weft
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Restate (durable workflow engine)
+  # ---------------------------------------------------------------------------
+  restate:
+    image: ghcr.io/restatedev/restate:1
+    volumes:
+      - restate-data:/restate-data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Orchestrator (Restate service endpoint + in-memory executor)
+  #
+  # Runs two servers internally:
+  #   - port 9080: Restate SDK endpoint (TaskRegistry, NodeInstanceRegistry, …)
+  #   - port 9081: Axum executor (receives project execution requests from weft-api)
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build: .
+    command: ["/usr/local/bin/orchestrator"]
+    environment:
+      RESTATE_URL: http://restate:8080
+      EXECUTOR_CALLBACK_URL: http://orchestrator:9081
+      RUST_LOG: ${RUST_LOG:-info}
+      # API keys forwarded to node executors
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      APOLLO_API_KEY: ${APOLLO_API_KEY:-}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+    depends_on:
+      - restate
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Restate init: polls until Restate and the orchestrator are ready, then
+  # registers the orchestrator endpoint with Restate. Runs once and exits.
+  # ---------------------------------------------------------------------------
+  restate-init:
+    image: curlimages/curl:latest
+    depends_on:
+      - restate
+      - orchestrator
+    command: >-
+      sh -c "
+        until curl -sf http://restate:9070/health; do echo 'waiting for Restate...'; sleep 3; done &&
+        until curl -sf http://orchestrator:9080/health; do echo 'waiting for orchestrator...'; sleep 3; done &&
+        curl -sf -X POST http://restate:9070/deployments
+          -H 'Content-Type: application/json'
+          -d '{\"uri\":\"http://orchestrator:9080\",\"force\":true}'
+      "
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Weft API
+  # ---------------------------------------------------------------------------
+  api:
+    build: .
+    command: ["/usr/local/bin/weft-api"]
+    ports:
+      - "${WEFT_API_PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/weft
+      RESTATE_URL: http://restate:8080
+      EXECUTOR_URL: http://orchestrator:9081
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-cloud}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY is required in cloud mode}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
+      API_BASE_URL: ${API_BASE_URL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-200}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-5000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      restate-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Dashboard (SvelteKit)
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    ports:
+      - "${DASHBOARD_PORT:-80}:3000"
+    environment:
+      NODE_ENV: production
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-cloud}
+      # SvelteKit requires ORIGIN for CSRF protection in production
+      ORIGIN: ${ORIGIN:?ORIGIN is required (e.g. https://app.yourdomain.com)}
+      # Internal URL for server-side API calls (dashboard → api)
+      API_URL: http://api:3000
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  restate-data:

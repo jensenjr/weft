@@ -1,15 +1,26 @@
-# Heavy dirs not needed in Docker builds
+# Rust build artifacts
 target/
+
+# Dashboard generated files
 dashboard/node_modules/
 dashboard/.svelte-kit/
+dashboard/build/
+
+# Not needed in Docker builds
 extension/
+sidecars/
 .git/
+
+# Restate local data
 restate-data/
 restate-data-cloud/
 
-# Dev-only files
+# Secrets and local config (never bake into images)
 .env
 .env.*
+.claude/
+
+# SQLite dev databases
 *.db
 *.db-journal
 *.db-shm
